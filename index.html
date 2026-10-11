@@ -1,0 +1,852 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>OBS Snowflakes Snowmen – Gusts & Density (Transparent)</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+      background: transparent; /* transparent for OBS */
+    }
+    canvas {
+      display: block;
+      background: transparent; /* keep canvas transparent too */
+    }
+  </style>
+</head>
+<body>
+<canvas id="snowCanvas"></canvas>
+
+<script>
+(() => {
+  const canvas = document.getElementById("snowCanvas");
+  const ctx = canvas.getContext("2d");
+
+  // --- CONFIG ---
+  const BASE_FLAKE_COUNT = 260;         // base max flakes
+  const GROUND_SEGMENT_WIDTH = 4;       // smaller = smoother ground
+  const SNOWMAN_MIN_HEIGHT = 40;        // pile height to spawn snowman (px)
+  const SNOWMAN_LIFETIME_MIN = 30000;   // ms
+  const SNOWMAN_LIFETIME_EXTRA = 20000; // ms
+  const SNOWMAN_BOTTOM_OFFSET = 22;     // how far above bottom line the snowman sits
+  const MAX_GROUND_HEIGHT = 45;      // maximum height (px) the snow can build up
+  const GROUND_SMOOTH_BLEND = 0.18;   // 0–1: how strongly to smooth each frame
+
+  // Parse URL parameters
+  const urlParams = new URLSearchParams(window.location.search);
+  const SNOW_SPEED_MODIFIER = parseFloat(urlParams.get('speed')) || 1.0; // default 1.0x
+  const SHOW_BACKGROUND = urlParams.get('background') === 'true'; // default false (transparent)
+
+  let width = 0;
+  let height = 0;
+  let flakes = [];
+  let ground = [];
+  let snowmen = [];
+
+  // --- WIND GUST STATE (isolated, periodic-ish) ---
+  const gust = {
+    active: false,
+    x: 0,
+    y: 0,
+    radius: 0,
+    strength: 0,
+    startTime: 0,
+    duration: 0
+  };
+  let nextGustTime = performance.now() + 8000 + Math.random() * 12000; // 8–20s to first gust
+
+  function startGust(now) {
+    gust.active = true;
+    gust.startTime = now;
+    gust.duration = 2000 + Math.random() * 2000; // 2–4s gust
+    // Center somewhere in the mid-screen, not edges
+    gust.x = width * (0.25 + Math.random() * 0.5);
+    gust.y = height * (0.25 + Math.random() * 0.5);
+    // Fairly localized swirl
+    gust.radius = Math.max(width, height) * (0.35 + Math.random() * 0.15);
+    gust.strength = 120 + Math.random() * 80;
+  }
+
+  function updateGust(now) {
+    if (!gust.active && now >= nextGustTime) {
+      startGust(now);
+    }
+
+    if (gust.active) {
+      const t = (now - gust.startTime) / gust.duration;
+      if (t >= 1) {
+        gust.active = false;
+        // Next gust in 10–22 seconds (isolated pockets of chaos)
+        nextGustTime = now + 10000 + Math.random() * 12000;
+      }
+    }
+  }
+
+  // --- DENSITY STATE (more / less snow over time) ---
+  const densityState = {
+    current: 1,   // multiplier
+    target: 1,
+    lastChange: performance.now(),
+    nextChange: performance.now() + 15000 + Math.random() * 15000
+  };
+
+  function pickNewDensityTarget(now) {
+    densityState.lastChange = now;
+    // Light flurries to heavy snow: 0.4x – 1.6x base
+    densityState.target = 0.4 + Math.random() * 1.2;
+    // Change every 15–30 seconds
+    densityState.nextChange = now + 15000 + Math.random() * 15000;
+  }
+
+  function updateDensity(now, dt) {
+    if (now >= densityState.nextChange) {
+      pickNewDensityTarget(now);
+    }
+    // Smoothly ease current towards target
+    const blend = Math.min(1, dt / 4000); // slow, smooth
+    densityState.current += (densityState.target - densityState.current) * blend;
+  }
+
+  function resize() {
+    width = canvas.width = window.innerWidth;
+    height = canvas.height = window.innerHeight;
+    const segments = Math.max(1, Math.floor(width / GROUND_SEGMENT_WIDTH));
+    ground = new Array(segments).fill(0);
+  }
+
+  window.addEventListener("resize", resize);
+  resize();
+
+  class Snowflake {
+    constructor() {
+      this.reset(false);
+    }
+
+    reset(spawnTop) {
+      this.x = Math.random() * width;
+      this.y = spawnTop ? -Math.random() * height : Math.random() * height;
+      this.radius = 1.5 + Math.random() * 2.5;
+      this.baseSpeed = (20 + Math.random() * 40) * SNOW_SPEED_MODIFIER; // fall speed with URL modifier
+      this.swingAmplitude = 10 + Math.random() * 20;
+      this.swingSpeed = 0.5 + Math.random();
+      this.angleOffset = Math.random() * Math.PI * 2;
+      this.density = 0.6 + Math.random() * 1.4; // per-flake variation
+    }
+
+    update(dt, time, globalDensity) {
+      const t = time;
+      const dtSec = dt / 1000;
+
+      // Global density affects speed slightly (heavier snow feels more chaotic)
+      const speedFactor = 0.7 + globalDensity * 0.4;
+
+      // Soft background wind
+      const baseWind = Math.sin(t * 0.0003 + this.y * 0.01) * 20;
+
+      const sway = Math.sin(this.angleOffset + t * 0.001 * this.swingSpeed) *
+                   this.swingAmplitude;
+
+      this.x += (sway + baseWind) * dtSec;
+      this.y += this.baseSpeed * this.density * speedFactor * dtSec;
+
+      // Occasional swirling wind gust (localized, isolated)
+      if (gust.active) {
+        const gT = (time - gust.startTime) / gust.duration;
+        // Ease in / ease out envelope
+        let envelope;
+        if (gT <= 0.2) {
+          envelope = gT / 0.2;
+        } else if (gT >= 0.8) {
+          envelope = (1 - gT) / 0.2;
+        } else {
+          envelope = 1;
+        }
+
+        const dx = this.x - gust.x;
+        const dy = this.y - gust.y;
+        const dist = Math.sqrt(dx * dx + dy * dy) || 1;
+        const influence = Math.max(0, 1 - dist / gust.radius);
+
+        if (influence > 0) {
+          const localStrength = gust.strength * influence * envelope;
+
+          // Tangential swirl vector (perpendicular to radius)
+          const tx = -dy / dist;
+          const ty = dx / dist;
+
+          // Slight outward push too
+          const rx = dx / dist;
+          const ry = dy / dist;
+
+          this.x += (tx * localStrength + rx * localStrength * 0.4) * dtSec;
+          this.y += (ty * localStrength * 0.4 + ry * localStrength * 0.2) * dtSec;
+        }
+      }
+
+      // Wrap horizontally
+      if (this.x < 0) this.x += width;
+      if (this.x > width) this.x -= width;
+
+      // Collision with ground
+      const idx = Math.max(
+        0,
+        Math.min(ground.length - 1, Math.floor(this.x / GROUND_SEGMENT_WIDTH))
+      );
+      const baseHeight = ground[idx] || 0;
+      const groundY = height - baseHeight;
+
+      if (this.y + this.radius >= groundY) {
+        // Deposit this flake into the ground profile
+        const deposit = this.radius * 1.2;
+        for (let i = -1; i <= 1; i++) {
+          const gi = idx + i;
+          if (gi >= 0 && gi < ground.length) {
+            const falloff = 1 - Math.abs(i) * 0.4;
+            ground[gi] += deposit * falloff;
+          }
+        }
+
+        maybeSpawnSnowman(idx);
+        this.reset(true);
+      }
+
+      // If it somehow falls off screen, respawn
+      if (this.y - this.radius > height + 20) {
+        this.reset(true);
+      }
+    }
+
+    draw(ctx, globalDensity) {
+      // Global density affects visual opacity a bit
+      const alpha = Math.min(1, 0.5 + globalDensity * 0.5);
+
+      ctx.beginPath();
+      ctx.arc(this.x, this.y, this.radius, 0, Math.PI * 2);
+      ctx.fillStyle = `rgba(255,255,255,${alpha})`;
+      ctx.fill();
+    }
+  }
+
+  class Snowman {
+    constructor(x, groundHeight) {
+      this.x = x;
+      this.baseSize = 0.85 + Math.random() * 0.3; // size variation (moved up to use in baseY calc)
+      
+      // Calculate bottom ball radius for positioning
+      const bottomBallRadius = 18 * this.baseSize;
+      
+      // Spawn so bottom ball is ~50% submerged in snow
+      // Ground level is at (height - groundHeight), we want center at that level
+      const heightVariation = Math.random() * 10 - 5; // -5 to +5 px random offset
+      this.baseY = (height - groundHeight) + heightVariation;
+      
+      this.createdAt = performance.now();
+      this.buildDuration = 2500 + Math.random() * 1000; // 2.5-3.5s to form
+      this.lifetime = SNOWMAN_LIFETIME_MIN + Math.random() * SNOWMAN_LIFETIME_EXTRA;
+      this.buildProgress = 0;  // 0 to 1 during formation
+      this.meltProgress = 0;   // 0 to 1 during melting
+      this.isBuilding = true;
+      this.meltStartTime = 0;  // initialized to prevent undefined issues
+      
+      // Unique personality for this snowman
+      this.leanDirection = Math.random() > 0.5 ? 1 : -1;
+      this.leanAmount = 0.1 + Math.random() * 0.15;
+      
+      // Animation personality
+      this.bounceSpeed = 0.8 + Math.random() * 0.4; // how fast they bounce
+      this.bounceOffset = Math.random() * Math.PI * 2; // random phase
+      this.waveSpeed = 1.2 + Math.random() * 0.6; // how fast arms wave
+      this.waveOffset = Math.random() * Math.PI * 2;
+      this.leftArmBias = Math.random() * 0.5; // some wave more with left arm
+      this.rightArmBias = Math.random() * 0.5;
+      
+      // Falling features timing (random during melt)
+      this.noseDropTime = 0.3 + Math.random() * 0.3;  // when nose starts drooping
+      this.noseFallTime = 0.5 + Math.random() * 0.2;  // when nose falls off
+      this.eyesFallTime = 0.6 + Math.random() * 0.25; // when eyes fall
+      this.hatFallTime = 0.45 + Math.random() * 0.15; // when hat falls
+      
+      // Falling physics for features
+      this.nose = { x: 0, y: 0, vy: 0, onGround: false, hasFallen: false };
+      this.leftEye = { x: 0, y: 0, vy: 0, onGround: false, hasFallen: false };
+      this.rightEye = { x: 0, y: 0, vy: 0, onGround: false, hasFallen: false };
+      this.hat = { x: 0, y: 0, vy: 0, rotation: 0, vr: 0, onGround: false, hasFallen: false };
+      
+      // Puddle grows during melt
+      this.puddleSize = 0;
+    }
+
+    update(now, dt) {
+      const elapsed = now - this.createdAt;
+      
+      if (this.isBuilding) {
+        this.buildProgress = Math.min(1, elapsed / this.buildDuration);
+        if (this.buildProgress >= 1) {
+          this.isBuilding = false;
+          this.meltStartTime = now;
+        }
+      } else {
+        const meltElapsed = now - this.meltStartTime;
+        this.meltProgress = Math.min(1, meltElapsed / this.lifetime);
+        
+        // Puddle grows as snowman melts
+        this.puddleSize = this.meltProgress * 35 * this.baseSize;
+      }
+      
+      // Update falling features (gravity)
+      const dtSec = dt / 1000;
+      const gravity = 180; // pixels per second squared
+      const groundY = 5; // relative to snowman base
+      
+      // Update nose
+      if (this.nose.hasFallen && !this.nose.onGround) {
+        this.nose.vy += gravity * dtSec;
+        this.nose.y += this.nose.vy * dtSec;
+        if (this.nose.y >= groundY) {
+          this.nose.y = groundY;
+          this.nose.onGround = true;
+          this.nose.vy = 0;
+        }
+      }
+      
+      // Update left eye
+      if (this.leftEye.hasFallen && !this.leftEye.onGround) {
+        this.leftEye.vy += gravity * dtSec;
+        this.leftEye.y += this.leftEye.vy * dtSec;
+        if (this.leftEye.y >= groundY) {
+          this.leftEye.y = groundY;
+          this.leftEye.onGround = true;
+          this.leftEye.vy = 0;
+        }
+      }
+      
+      // Update right eye
+      if (this.rightEye.hasFallen && !this.rightEye.onGround) {
+        this.rightEye.vy += gravity * dtSec;
+        this.rightEye.y += this.rightEye.vy * dtSec;
+        if (this.rightEye.y >= groundY) {
+          this.rightEye.y = groundY;
+          this.rightEye.onGround = true;
+          this.rightEye.vy = 0;
+        }
+      }
+      
+      // Update hat (with rotation)
+      if (this.hat.hasFallen && !this.hat.onGround) {
+        this.hat.vy += gravity * dtSec;
+        this.hat.y += this.hat.vy * dtSec;
+        this.hat.vr += 2 * dtSec; // angular velocity increases
+        this.hat.rotation += this.hat.vr * dtSec;
+        if (this.hat.y >= groundY) {
+          this.hat.y = groundY;
+          this.hat.onGround = true;
+          this.hat.vy = 0;
+          this.hat.vr = 0;
+        }
+      }
+    }
+
+    isGone() {
+      return this.meltProgress >= 1;
+    }
+
+    // Easing functions for natural motion
+    easeOutBack(t) {
+      const c1 = 1.70158;
+      const c3 = c1 + 1;
+      return 1 + c3 * Math.pow(t - 1, 3) + c1 * Math.pow(t - 1, 2);
+    }
+    
+    easeOutElastic(t) {
+      if (t === 0 || t === 1) return t;
+      return Math.pow(2, -10 * t) * Math.sin((t * 10 - 0.75) * (2 * Math.PI) / 3) + 1;
+    }
+    
+    easeInQuad(t) {
+      return t * t;
+    }
+
+    draw(ctx) {
+      const build = this.buildProgress;
+      const melt = this.meltProgress;
+      const size = this.baseSize;
+      const now = performance.now();
+      
+      // --- IDLE ANIMATIONS (bounce & wave) ---
+      const idleBounce = !this.isBuilding && melt < 0.3 ? 
+        Math.sin((now - this.createdAt) * 0.001 * this.bounceSpeed + this.bounceOffset) * 2 : 0;
+      
+      const leftArmWave = !this.isBuilding && melt < 0.4 ?
+        Math.sin((now - this.createdAt) * 0.001 * this.waveSpeed + this.waveOffset + this.leftArmBias) * 0.3 : 0;
+      
+      const rightArmWave = !this.isBuilding && melt < 0.4 ?
+        Math.sin((now - this.createdAt) * 0.001 * this.waveSpeed + this.waveOffset + Math.PI + this.rightArmBias) * 0.3 : 0;
+      
+      // --- FORMATION ANIMATION ---
+      // Each ball "pops" up sequentially with bounce
+      let baseScale, midScale, headScale;
+      let baseOffsetY = 0, midOffsetY = 0, headOffsetY = 0;
+      
+      if (this.isBuilding) {
+        // Base forms first (0-40% of build time)
+        const baseT = Math.min(1, build / 0.4);
+        baseScale = this.easeOutBack(baseT);
+        baseOffsetY = (1 - baseScale) * 20; // rises up from ground
+        
+        // Middle forms second (20-70% of build time)
+        const midT = Math.max(0, Math.min(1, (build - 0.2) / 0.5));
+        midScale = this.easeOutElastic(midT);
+        midOffsetY = (1 - midScale) * 15;
+        
+        // Head forms last (50-100% of build time)
+        const headT = Math.max(0, Math.min(1, (build - 0.5) / 0.5));
+        headScale = this.easeOutElastic(headT);
+        headOffsetY = (1 - headScale) * 10;
+      } else {
+        baseScale = midScale = headScale = 1;
+      }
+      
+      // --- MELTING ANIMATION ---
+      // Each part melts at different rates (top fastest)
+      const headMelt = Math.min(1, melt * 1.8);      // head melts fastest
+      const midMelt = Math.min(1, melt * 1.4);       // middle melts medium
+      const baseMelt = melt;                          // base melts slowest
+      
+      // Radii with formation and melting (ensure they never go negative)
+      const baseRadius = Math.max(0, 18 * size * baseScale * (1 - 0.5 * this.easeInQuad(baseMelt)));
+      const midRadius = Math.max(0, 12 * size * midScale * (1 - 0.7 * this.easeInQuad(midMelt)));
+      const headRadius = Math.max(0, 8 * size * headScale * (1 - 0.85 * this.easeInQuad(headMelt)));
+      
+      // Squishing - balls flatten as they melt (width increases, height decreases)
+      const baseSquishX = 1 + 0.6 * baseMelt;
+      const baseSquishY = 1 - 0.3 * baseMelt;
+      const midSquishX = 1 + 0.8 * midMelt;
+      const midSquishY = 1 - 0.4 * midMelt;
+      const headSquishX = 1 + 1.0 * headMelt;
+      const headSquishY = 1 - 0.5 * headMelt;
+      
+      // Leaning/tilting as structure weakens
+      const tiltAngle = melt * this.leanAmount * this.leanDirection * Math.PI;
+      
+      // Sinking into puddle
+      const sink = melt * 12 * size;
+      
+      // Overall alpha fade at very end
+      let alpha = 1;
+      if (melt > 0.85) {
+        alpha = 1 - (melt - 0.85) / 0.15;
+      }
+      
+      ctx.save();
+      ctx.translate(this.x, this.baseY + sink + idleBounce);
+      
+      // Draw puddle first (behind snowman)
+      if (this.puddleSize > 0) {
+        const puddleAlpha = Math.min(0.4, melt * 0.5);
+        ctx.fillStyle = `rgba(200, 220, 255, ${puddleAlpha})`;
+        ctx.beginPath();
+        ctx.ellipse(0, 5, this.puddleSize, this.puddleSize * 0.3, 0, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      
+      // Apply tilt for whole snowman
+      ctx.rotate(tiltAngle);
+      ctx.globalAlpha = alpha;
+      
+      // --- Draw stick arms (behind snowman) ---
+      if (midRadius > 1 && melt < 0.5) {
+        const midY = -baseRadius * baseSquishY * 1.1 + midOffsetY;
+        const armY = midY - midRadius * 0.3;
+        const armLength = 15 * size;
+        const armFade = melt < 0.3 ? 1 : 1 - (melt - 0.3) / 0.2;
+        
+        ctx.strokeStyle = `rgba(101, 67, 33, ${armFade})`;
+        ctx.lineWidth = 1.5;
+        ctx.lineCap = 'round';
+        
+        // Left arm
+        ctx.save();
+        ctx.translate(-midRadius * 0.8, armY);
+        ctx.rotate(-0.5 + leftArmWave);
+        ctx.beginPath();
+        ctx.moveTo(0, 0);
+        ctx.lineTo(-armLength * 0.7, -armLength * 0.4);
+        ctx.stroke();
+        // fingers
+        ctx.beginPath();
+        ctx.moveTo(-armLength * 0.7, -armLength * 0.4);
+        ctx.lineTo(-armLength * 0.9, -armLength * 0.5);
+        ctx.moveTo(-armLength * 0.7, -armLength * 0.4);
+        ctx.lineTo(-armLength * 0.85, -armLength * 0.3);
+        ctx.stroke();
+        ctx.restore();
+        
+        // Right arm
+        ctx.save();
+        ctx.translate(midRadius * 0.8, armY);
+        ctx.rotate(0.5 + rightArmWave);
+        ctx.beginPath();
+        ctx.moveTo(0, 0);
+        ctx.lineTo(armLength * 0.7, -armLength * 0.4);
+        ctx.stroke();
+        // fingers
+        ctx.beginPath();
+        ctx.moveTo(armLength * 0.7, -armLength * 0.4);
+        ctx.lineTo(armLength * 0.9, -armLength * 0.5);
+        ctx.moveTo(armLength * 0.7, -armLength * 0.4);
+        ctx.lineTo(armLength * 0.85, -armLength * 0.3);
+        ctx.stroke();
+        ctx.restore();
+      }
+      
+      // --- Draw Base ---
+      ctx.save();
+      ctx.translate(0, baseOffsetY);
+      ctx.scale(baseSquishX, baseSquishY);
+      ctx.fillStyle = "white";
+      ctx.beginPath();
+      ctx.arc(0, 0, baseRadius, 0, Math.PI * 2);
+      ctx.fill();
+      // Subtle shadow/depth
+      ctx.fillStyle = "rgba(200, 210, 230, 0.3)";
+      ctx.beginPath();
+      ctx.arc(baseRadius * 0.2, baseRadius * 0.1, baseRadius * 0.85, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+      
+      // --- Draw Middle ---
+      if (midRadius > 1) {
+        const midY = -baseRadius * baseSquishY * 1.1 + midOffsetY;
+        ctx.save();
+        ctx.translate(0, midY);
+        ctx.scale(midSquishX, midSquishY);
+        ctx.fillStyle = "white";
+        ctx.beginPath();
+        ctx.arc(0, 0, midRadius, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.fillStyle = "rgba(200, 210, 230, 0.25)";
+        ctx.beginPath();
+        ctx.arc(midRadius * 0.15, midRadius * 0.1, midRadius * 0.8, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.restore();
+      }
+      
+      // --- Draw Head ---
+      const headY = -baseRadius * baseSquishY * 1.1 - midRadius * midSquishY * 1.2 + headOffsetY;
+      if (headRadius > 1) {
+        ctx.save();
+        ctx.translate(0, headY);
+        ctx.scale(headSquishX, headSquishY);
+        ctx.fillStyle = "white";
+        ctx.beginPath();
+        ctx.arc(0, 0, headRadius, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.fillStyle = "rgba(200, 210, 230, 0.2)";
+        ctx.beginPath();
+        ctx.arc(headRadius * 0.1, headRadius * 0.1, headRadius * 0.75, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.restore();
+        
+        // --- Eyes ---
+        if (melt < this.eyesFallTime) {
+          // Eyes still on face
+          const eyeY = headY - headRadius * 0.3 * headSquishY;
+          const eyeSpread = 3 * headSquishX;
+          const eyeSize = 1.2 * Math.min(headSquishX, 1.2);
+          ctx.fillStyle = "#222";
+          ctx.beginPath();
+          ctx.arc(-eyeSpread, eyeY, eyeSize, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.beginPath();
+          ctx.arc(eyeSpread, eyeY, eyeSize, 0, Math.PI * 2);
+          ctx.fill();
+        } else if (melt < 0.95) {
+          // Eyes have fallen - trigger fall if not already falling
+          if (!this.leftEye.hasFallen) {
+            const eyeY = headY - headRadius * 0.3 * headSquishY;
+            const eyeSpread = 3 * headSquishX;
+            this.leftEye.x = -eyeSpread + Math.random() * 2 - 1;
+            this.leftEye.y = eyeY;
+            this.leftEye.vy = 0;
+            this.leftEye.hasFallen = true;
+            this.rightEye.x = eyeSpread + Math.random() * 2 - 1;
+            this.rightEye.y = eyeY;
+            this.rightEye.vy = 0;
+            this.rightEye.hasFallen = true;
+          }
+          
+          // Draw falling/fallen eyes
+          const fallProgress = (melt - this.eyesFallTime) / (0.95 - this.eyesFallTime);
+          const eyeAlpha = 1 - fallProgress * 0.3; // slight fade
+          ctx.fillStyle = `rgba(34, 34, 34, ${eyeAlpha})`;
+          
+          ctx.beginPath();
+          ctx.arc(this.leftEye.x, this.leftEye.y, 1.2, 0, Math.PI * 2);
+          ctx.fill();
+          
+          ctx.beginPath();
+          ctx.arc(this.rightEye.x, this.rightEye.y, 1.2, 0, Math.PI * 2);
+          ctx.fill();
+        }
+        
+        // --- Carrot Nose ---
+        if (melt < this.noseFallTime) {
+          // Nose still attached but drooping
+          const droopAmount = melt < this.noseDropTime ? 0 : 
+            ((melt - this.noseDropTime) / (this.noseFallTime - this.noseDropTime)) * 0.8;
+          const noseY = headY + headRadius * 0.1 * headSquishY;
+          const noseLength = 6 * (1 - droopAmount * 0.3);
+          
+          ctx.save();
+          ctx.translate(0, noseY);
+          ctx.rotate(droopAmount * Math.PI * 0.4); // droop downward
+          ctx.fillStyle = "#f97316";
+          ctx.beginPath();
+          ctx.moveTo(0, 0);
+          ctx.lineTo(noseLength, 0.5);
+          ctx.lineTo(0, 1.5);
+          ctx.closePath();
+          ctx.fill();
+          ctx.restore();
+        } else if (melt < 0.9) {
+          // Nose has fallen - trigger fall if not already falling
+          if (!this.nose.hasFallen) {
+            const noseY = headY + headRadius * 0.1 * headSquishY;
+            this.nose.x = Math.random() * 4 - 2;
+            this.nose.y = noseY;
+            this.nose.vy = 0;
+            this.nose.hasFallen = true;
+          }
+          
+          // Draw falling/fallen nose
+          const noseAlpha = 1 - (melt - this.noseFallTime) / (0.9 - this.noseFallTime) * 0.2;
+          ctx.fillStyle = `rgba(249, 115, 22, ${noseAlpha})`;
+          ctx.beginPath();
+          ctx.moveTo(this.nose.x, this.nose.y);
+          ctx.lineTo(this.nose.x + 5, this.nose.y + 0.5);
+          ctx.lineTo(this.nose.x, this.nose.y + 1.5);
+          ctx.closePath();
+          ctx.fill();
+        }
+        
+        // --- Top Hat ---
+        if (melt < this.hatFallTime) {
+          // Hat still on head
+          const hatY = headY - headRadius * headSquishY - 3;
+          const hatWidth = 8 * size;
+          const hatHeight = 6 * size;
+          const brimWidth = 11 * size;
+          
+          ctx.fillStyle = "#1a1a1a";
+          // Brim
+          ctx.fillRect(-brimWidth / 2, hatY, brimWidth, 1.5);
+          // Top
+          ctx.fillRect(-hatWidth / 2, hatY - hatHeight, hatWidth, hatHeight);
+          
+          // Highlight
+          ctx.fillStyle = "rgba(255,255,255,0.15)";
+          ctx.fillRect(-hatWidth / 2 + 1, hatY - hatHeight + 1, 2, hatHeight - 2);
+        } else if (melt < 0.85) {
+          // Hat has fallen - trigger fall if not already falling
+          if (!this.hat.hasFallen) {
+            const hatY = headY - headRadius * headSquishY - 3;
+            this.hat.x = Math.random() * 6 - 3;
+            this.hat.y = hatY;
+            this.hat.vy = 0;
+            this.hat.rotation = 0;
+            this.hat.vr = (Math.random() - 0.5) * 2; // random spin direction
+            this.hat.hasFallen = true;
+          }
+          
+          // Draw falling/fallen hat
+          const hatWidth = 8 * size;
+          const hatHeight = 6 * size;
+          const brimWidth = 11 * size;
+          const fallProgress = (melt - this.hatFallTime) / (0.85 - this.hatFallTime);
+          const hatAlpha = 1 - fallProgress * 0.4;
+          
+          ctx.save();
+          ctx.translate(this.hat.x, this.hat.y);
+          ctx.rotate(this.hat.rotation);
+          ctx.globalAlpha = hatAlpha;
+          ctx.fillStyle = "#1a1a1a";
+          ctx.fillRect(-brimWidth / 2, 0, brimWidth, 1.5);
+          ctx.fillRect(-hatWidth / 2, -hatHeight, hatWidth, hatHeight);
+          ctx.fillStyle = "rgba(255,255,255,0.15)";
+          ctx.fillRect(-hatWidth / 2 + 1, -hatHeight + 1, 2, hatHeight - 2);
+          ctx.restore();
+          ctx.globalAlpha = alpha;
+        }
+      }
+      
+      ctx.restore();
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  function maybeSpawnSnowman(groundIndex) {
+    const heightHere = ground[groundIndex];
+    const threshold = SNOWMAN_MIN_HEIGHT + Math.random() * 30;
+
+    if (heightHere < threshold) return;
+
+    const x = (groundIndex + 0.5) * GROUND_SEGMENT_WIDTH;
+
+    // Don't spawn too close to an existing snowman
+    const minDistance = 60;
+    if (snowmen.some(s => Math.abs(s.x - x) < minDistance)) return;
+
+    // Reduce snow around them FIRST with wider, gentler cutout
+    for (let i = -12; i <= 12; i++) {
+      const gi = groundIndex + i;
+      if (gi >= 0 && gi < ground.length) {
+        const falloff = 1 - Math.abs(i) / 12; // center gets reduced more
+        ground[gi] *= 0.3 + 0.4 * falloff;   // gentler reduction leaving more snow
+      }
+    }
+
+    // Now spawn snowman at the NEW ground height after cutout
+    const finalGroundHeight = ground[groundIndex];
+    snowmen.push(new Snowman(x, finalGroundHeight));
+  }
+
+  function initFlakes(count) {
+    flakes = [];
+    for (let i = 0; i < count; i++) {
+      flakes.push(new Snowflake());
+    }
+  }
+
+  initFlakes(BASE_FLAKE_COUNT);
+
+  // Background: transparent by default, black if background=true
+  function drawBackground() {
+    if (SHOW_BACKGROUND) {
+      ctx.fillStyle = '#000000';
+      ctx.fillRect(0, 0, width, height);
+    } else {
+      ctx.clearRect(0, 0, width, height);
+    }
+  }
+
+  function drawGround() {
+    ctx.save();
+    ctx.fillStyle = "rgba(255,255,255,0.95)";
+    ctx.beginPath();
+    ctx.moveTo(0, height);
+
+    for (let i = 0; i < ground.length; i++) {
+      const x = i * GROUND_SEGMENT_WIDTH;
+      const y = height - ground[i];
+      ctx.lineTo(x, y);
+    }
+
+    ctx.lineTo(width, height);
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
+  }
+  
+function smoothGround() {
+  if (!ground || ground.length === 0) return;
+
+  const smoothed = ground.slice();
+
+  // How aggressive we are on sharp spikes vs gentle slopes
+  const SPIKE_THRESHOLD = 10;  // how big the difference must be to be considered a spike
+  const MAX_STEP = 2.5;        // max pixels a cell can move per frame toward smoothness
+
+  for (let i = 0; i < ground.length; i++) {
+    const left  = i > 0 ? ground[i - 1] : ground[i];
+    const mid   = ground[i];
+    const right = i < ground.length - 1 ? ground[i + 1] : ground[i];
+
+    // We DON'T just average everything; we mostly preserve mid,
+    // but nudge it toward its neighbors if it's a spike.
+    const neighborAvg = (left + right) / 2;
+    let target = (mid * 0.65) + (neighborAvg * 0.35); // keep more of the original shape
+
+    let diff = target - mid;
+    const absDiff = Math.abs(diff);
+
+    // Only strongly smooth when it's a noticeable spike
+    if (absDiff < SPIKE_THRESHOLD) {
+      // small variation: barely smooth (preserve mounds & bumps)
+      diff *= 0.3;
+    }
+
+    // Limit how much any single segment can change in one frame
+    if (diff > MAX_STEP) diff = MAX_STEP;
+    if (diff < -MAX_STEP) diff = -MAX_STEP;
+
+    // Move a little bit toward the target
+    smoothed[i] = mid + diff * GROUND_SMOOTH_BLEND;
+
+    // Clamp height so it doesn't pile up forever
+    if (smoothed[i] > MAX_GROUND_HEIGHT) {
+      smoothed[i] = MAX_GROUND_HEIGHT;
+    }
+    if (smoothed[i] < 0) {
+      smoothed[i] = 0;
+    }
+  }
+
+  ground = smoothed;
+}
+
+  let lastTime = performance.now();
+
+  function loop(now) {
+    const dt = now - lastTime;
+    lastTime = now;
+
+    updateGust(now);
+    updateDensity(now, dt);
+
+    const globalDensity = densityState.current;
+
+    // Clamp active flake count to avoid freezing from undefined array entries
+    const activeFlakeCount = Math.min(
+      flakes.length,
+      Math.max(
+        20,
+        Math.floor(BASE_FLAKE_COUNT * Math.max(0.2, Math.min(globalDensity, 1.6)))
+      )
+    );
+
+    // Background (transparent clear)
+    drawBackground();
+
+    // Snowflakes
+    for (let i = 0; i < activeFlakeCount; i++) {
+      const f = flakes[i];
+      if (!f) break;
+      f.update(dt, now, globalDensity);
+      f.draw(ctx, globalDensity);
+    }
+
+    // Snowmen
+    for (const s of snowmen) {
+      s.update(now, dt);
+    }
+    snowmen = snowmen.filter(s => !s.isGone());
+    
+    // Let the snow settle / flatten a bit each frame
+    smoothGround();
+    
+    // Ground + snowmen on top
+    drawGround();
+    for (const s of snowmen) {
+      s.draw(ctx);
+    }
+
+    requestAnimationFrame(loop);
+  }
+
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>

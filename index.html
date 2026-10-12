@@ -50,32 +50,40 @@
     active: false,
     x: 0,
     y: 0,
+    vx: 0,        // the gust drifts across the screen while it blows (px/s)
     radius: 0,
     strength: 0,
+    spin: 1,      // which way it swirls
     startTime: 0,
-    duration: 0
+    duration: 0,
+    envelope: 0   // 0..1, how hard it's blowing right now
   };
   let nextGustTime = performance.now() + 8000 + Math.random() * 12000; // 8–20s to first gust
 
   function startGust(now) {
     gust.active = true;
     gust.startTime = now;
-    gust.duration = 2000 + Math.random() * 2000; // 2–4s gust
+    gust.duration = 5000 + Math.random() * 3000; // 5–8s: builds up, blows, dies down
     // Center somewhere in the mid-screen, not edges
     gust.x = width * (0.25 + Math.random() * 0.5);
     gust.y = height * (0.25 + Math.random() * 0.5);
+    gust.vx = (Math.random() < 0.5 ? -1 : 1) * (30 + Math.random() * 50);
     // Fairly localized swirl
     gust.radius = Math.max(width, height) * (0.35 + Math.random() * 0.15);
-    gust.strength = 120 + Math.random() * 80;
+    gust.strength = 110 + Math.random() * 70;
+    gust.spin = Math.random() < 0.5 ? -1 : 1;
   }
 
-  function updateGust(now) {
+  function updateGust(now, dt) {
+    if (gust.active) gust.x += gust.vx * dt / 1000;
     if (!gust.active && now >= nextGustTime) {
       startGust(now);
     }
 
     if (gust.active) {
       const t = (now - gust.startTime) / gust.duration;
+      // smooth rise and fall (sin²), no corners at the start, peak or end
+      gust.envelope = t >= 1 ? 0 : Math.sin(Math.PI * t) ** 2;
       if (t >= 1) {
         gust.active = false;
         // Next gust in 10–22 seconds (isolated pockets of chaos)
@@ -112,22 +120,30 @@
   function resize() {
     width = canvas.width = window.innerWidth;
     height = canvas.height = window.innerHeight;
-    const segments = Math.max(1, Math.floor(width / GROUND_SEGMENT_WIDTH));
+    // one more column than fits, so the last one reaches (or passes) the right edge
+    const segments = Math.max(1, Math.ceil(width / GROUND_SEGMENT_WIDTH) + 1);
     ground = new Array(segments).fill(0);
   }
 
   window.addEventListener("resize", resize);
   resize();
 
+  // Flakes may drift a little past the sides before wrapping, so they never appear or vanish
+  // in view; every flake starts above the top edge.
+  const EDGE_MARGIN = 12;
+
   class Snowflake {
     constructor() {
-      this.reset(false);
+      this.reset(true, true);
     }
 
-    reset(spawnTop) {
-      this.x = Math.random() * width;
-      this.y = spawnTop ? -Math.random() * height : Math.random() * height;
+    reset(spawnTop, first) {
       this.radius = 1.5 + Math.random() * 2.5;
+      this.x = -EDGE_MARGIN + Math.random() * (width + EDGE_MARGIN * 2);
+      // first fill staggers flakes up to a screen above; later ones queue just above the top
+      this.y = -this.radius - EDGE_MARGIN - Math.random() * height * (first ? 1 : 0.5);
+      this.wx = 0; // wind velocity this flake has picked up (px/s): it eases toward the wind
+      this.wy = 0;
       this.baseSpeed = (20 + Math.random() * 40) * SNOW_SPEED_MODIFIER; // fall speed with URL modifier
       this.swingAmplitude = 10 + Math.random() * 20;
       this.swingSpeed = 0.5 + Math.random();
@@ -148,48 +164,49 @@
       const sway = Math.sin(this.angleOffset + t * 0.001 * this.swingSpeed) *
                    this.swingAmplitude;
 
-      this.x += (sway + baseWind) * dtSec;
-      this.y += this.baseSpeed * this.density * speedFactor * dtSec;
-
-      // Occasional swirling wind gust (localized, isolated)
-      if (gust.active) {
-        const gT = (time - gust.startTime) / gust.duration;
-        // Ease in / ease out envelope
-        let envelope;
-        if (gT <= 0.2) {
-          envelope = gT / 0.2;
-        } else if (gT >= 0.8) {
-          envelope = (1 - gT) / 0.2;
-        } else {
-          envelope = 1;
-        }
-
+      // The wind this flake feels: the soft background breeze plus any gust
+      let windX = baseWind, windY = 0;
+      if (gust.active && gust.envelope > 0) {
         const dx = this.x - gust.x;
         const dy = this.y - gust.y;
         const dist = Math.sqrt(dx * dx + dy * dy) || 1;
-        const influence = Math.max(0, 1 - dist / gust.radius);
+        // soft edge: full strength near the middle, fading smoothly to nothing at the radius
+        const u = Math.min(1, dist / gust.radius);
+        const influence = 1 - u * u * (3 - 2 * u);
 
         if (influence > 0) {
-          const localStrength = gust.strength * influence * envelope;
+          const localStrength = gust.strength * influence * gust.envelope;
 
           // Tangential swirl vector (perpendicular to radius)
-          const tx = -dy / dist;
-          const ty = dx / dist;
+          const tx = -dy / dist * gust.spin;
+          const ty = dx / dist * gust.spin;
 
           // Slight outward push too
           const rx = dx / dist;
           const ry = dy / dist;
 
-          this.x += (tx * localStrength + rx * localStrength * 0.4) * dtSec;
-          this.y += (ty * localStrength * 0.4 + ry * localStrength * 0.2) * dtSec;
+          windX += tx * localStrength + rx * localStrength * 0.4;
+          windY += ty * localStrength * 0.4 + ry * localStrength * 0.2;
         }
       }
+      // Flakes have a little momentum: they ease into the wind (bigger flakes a bit slower)
+      // instead of snapping to it, so gusts pick them up and let them go smoothly.
+      const ease = 1 - Math.exp(-dtSec / (0.45 + this.radius * 0.12));
+      this.wx += (windX - this.wx) * ease;
+      this.wy += (windY - this.wy) * ease;
 
-      // Wrap horizontally
-      if (this.x < 0) this.x += width;
-      if (this.x > width) this.x -= width;
+      this.x += (sway + this.wx) * dtSec;
+      this.y += (this.baseSpeed * this.density * speedFactor + this.wy) * dtSec;
 
-      // Collision with ground
+      // Wrap horizontally, only once the flake is fully out of view
+      if (this.x < -EDGE_MARGIN) this.x += width + EDGE_MARGIN * 2;
+      if (this.x > width + EDGE_MARGIN) this.x -= width + EDGE_MARGIN * 2;
+
+      // Collision with ground (only on screen; past the sides it just falls out of view)
+      if (this.x < 0 || this.x >= width) {
+        if (this.y - this.radius > height) this.reset(true);
+        return;
+      }
       const idx = Math.max(
         0,
         Math.min(ground.length - 1, Math.floor(this.x / GROUND_SEGMENT_WIDTH))
@@ -198,6 +215,13 @@
       const groundY = height - baseHeight;
 
       if (this.y + this.radius >= groundY) {
+        // A snowman that's still forming catches flakes that land on it, and grows a bit faster
+        const forming = snowmen.find(s => s.isBuilding && Math.abs(s.x - this.x) < 16 * s.baseSize);
+        if (forming) {
+          forming.fed += this.radius;
+          this.reset(true);
+          return;
+        }
         // Deposit this flake into the ground profile
         const deposit = this.radius * 1.2;
         for (let i = -1; i <= 1; i++) {
@@ -230,20 +254,30 @@
   }
 
   class Snowman {
-    constructor(x, groundHeight) {
+    constructor(x, groundIndex) {
       this.x = x;
-      this.baseSize = 0.85 + Math.random() * 0.3; // size variation (moved up to use in baseY calc)
-      
-      // Calculate bottom ball radius for positioning
-      const bottomBallRadius = 18 * this.baseSize;
-      
-      // Spawn so bottom ball is ~50% submerged in snow
-      // Ground level is at (height - groundHeight), we want center at that level
-      const heightVariation = Math.random() * 10 - 5; // -5 to +5 px random offset
-      this.baseY = (height - groundHeight) + heightVariation;
-      
+      this.gi = groundIndex;
+      this.baseSize = 0.85 + Math.random() * 0.3; // size variation
+
+      // The bottom ball sits about half buried in the snow under it; it follows that snow line
+      // while it builds, since it's taking snow from right around it
+      this.heightVariation = Math.random() * 10 - 5; // -5 to +5 px random offset
+      this.baseY = height - (ground[groundIndex] || 0) + this.heightVariation;
+
+      // Snow it will gather from the drift as it grows: most from right under it, tapering off
+      // to either side. It's taken a little at a time, never all at once.
+      this.gather = [];
+      for (let i = -12; i <= 12; i++) {
+        const gi = groundIndex + i;
+        if (gi >= 0 && gi < ground.length) {
+          const k = 1 - (i / 12) ** 2;
+          this.gather.push([gi, ground[gi] * 0.5 * k]);
+        }
+      }
+      this.fed = 0; // snow caught from flakes landing on it this frame
+
       this.createdAt = performance.now();
-      this.buildDuration = 2500 + Math.random() * 1000; // 2.5-3.5s to form
+      this.buildDuration = 9000 + Math.random() * 5000; // 9-14s to form (faster in heavy snow)
       this.lifetime = SNOWMAN_LIFETIME_MIN + Math.random() * SNOWMAN_LIFETIME_EXTRA;
       this.buildProgress = 0;  // 0 to 1 during formation
       this.meltProgress = 0;   // 0 to 1 during melting
@@ -282,7 +316,14 @@
       const elapsed = now - this.createdAt;
       
       if (this.isBuilding) {
-        this.buildProgress = Math.min(1, elapsed / this.buildDuration);
+        const before = this.buildProgress;
+        this.buildProgress = Math.min(1, before + dt / this.buildDuration + this.fed * 0.004);
+        this.fed = 0;
+        // gather this step's share of snow from the drift around it
+        const share = this.buildProgress - before;
+        for (const [gi, amount] of this.gather) ground[gi] = Math.max(0, ground[gi] - amount * share);
+        const sitY = height - (ground[this.gi] || 0) + this.heightVariation;
+        this.baseY += (sitY - this.baseY) * Math.min(1, dt / 400);
         if (this.buildProgress >= 1) {
           this.isBuilding = false;
           this.meltStartTime = now;
@@ -352,18 +393,7 @@
       return this.meltProgress >= 1;
     }
 
-    // Easing functions for natural motion
-    easeOutBack(t) {
-      const c1 = 1.70158;
-      const c3 = c1 + 1;
-      return 1 + c3 * Math.pow(t - 1, 3) + c1 * Math.pow(t - 1, 2);
-    }
-    
-    easeOutElastic(t) {
-      if (t === 0 || t === 1) return t;
-      return Math.pow(2, -10 * t) * Math.sin((t * 10 - 0.75) * (2 * Math.PI) / 3) + 1;
-    }
-    
+    // Easing for the melt
     easeInQuad(t) {
       return t * t;
     }
@@ -375,38 +405,38 @@
       const now = performance.now();
       
       // --- IDLE ANIMATIONS (bounce & wave) ---
-      const idleBounce = !this.isBuilding && melt < 0.3 ? 
-        Math.sin((now - this.createdAt) * 0.001 * this.bounceSpeed + this.bounceOffset) * 2 : 0;
-      
-      const leftArmWave = !this.isBuilding && melt < 0.4 ?
-        Math.sin((now - this.createdAt) * 0.001 * this.waveSpeed + this.waveOffset + this.leftArmBias) * 0.3 : 0;
-      
-      const rightArmWave = !this.isBuilding && melt < 0.4 ?
-        Math.sin((now - this.createdAt) * 0.001 * this.waveSpeed + this.waveOffset + Math.PI + this.rightArmBias) * 0.3 : 0;
-      
+      // they ease in over a second and a half once the snowman is finished, so nothing jumps
+      const settle = this.isBuilding ? 0 : Math.min(1, (now - this.meltStartTime) / 1500);
+      const idleBounce = melt < 0.3 ?
+        Math.sin((now - this.createdAt) * 0.001 * this.bounceSpeed + this.bounceOffset) * 2 * settle : 0;
+
+      const leftArmWave = melt < 0.4 ?
+        Math.sin((now - this.createdAt) * 0.001 * this.waveSpeed + this.waveOffset + this.leftArmBias) * 0.3 * settle : 0;
+
+      const rightArmWave = melt < 0.4 ?
+        Math.sin((now - this.createdAt) * 0.001 * this.waveSpeed + this.waveOffset + Math.PI + this.rightArmBias) * 0.3 * settle : 0;
+
       // --- FORMATION ANIMATION ---
-      // Each ball "pops" up sequentially with bounce
+      // Snow gathers into a mound that grows into the base, pushing up out of the drift, then the
+      // middle and the head build up on top. Smooth growth, no bounce.
       let baseScale, midScale, headScale;
       let baseOffsetY = 0, midOffsetY = 0, headOffsetY = 0;
-      
+      const grow = (t) => 1 - Math.pow(1 - t, 3);
+      const span = (a, b) => Math.max(0, Math.min(1, (build - a) / (b - a)));
+
       if (this.isBuilding) {
-        // Base forms first (0-40% of build time)
-        const baseT = Math.min(1, build / 0.4);
-        baseScale = this.easeOutBack(baseT);
-        baseOffsetY = (1 - baseScale) * 20; // rises up from ground
-        
-        // Middle forms second (20-70% of build time)
-        const midT = Math.max(0, Math.min(1, (build - 0.2) / 0.5));
-        midScale = this.easeOutElastic(midT);
-        midOffsetY = (1 - midScale) * 15;
-        
-        // Head forms last (50-100% of build time)
-        const headT = Math.max(0, Math.min(1, (build - 0.5) / 0.5));
-        headScale = this.easeOutElastic(headT);
-        headOffsetY = (1 - headScale) * 10;
+        const baseT = span(0, 0.45), midT = span(0.35, 0.75), headT = span(0.65, 0.95);
+        baseScale = grow(baseT);
+        baseOffsetY = (1 - baseT) * 16 * size;   // starts buried, rises as it grows
+        midScale = grow(midT);
+        midOffsetY = (1 - midT) * 4;
+        headScale = grow(headT);
+        headOffsetY = (1 - headT) * 3;
       } else {
         baseScale = midScale = headScale = 1;
       }
+      // face, arms and hat appear once the snow is all there
+      const appear = this.isBuilding ? span(0.85, 1) : 1;
       
       // --- MELTING ANIMATION ---
       // Each part melts at different rates (top fastest)
@@ -460,7 +490,7 @@
         const midY = -baseRadius * baseSquishY * 1.1 + midOffsetY;
         const armY = midY - midRadius * 0.3;
         const armLength = 15 * size;
-        const armFade = melt < 0.3 ? 1 : 1 - (melt - 0.3) / 0.2;
+        const armFade = (melt < 0.3 ? 1 : 1 - (melt - 0.3) / 0.2) * appear;
         
         ctx.strokeStyle = `rgba(101, 67, 33, ${armFade})`;
         ctx.lineWidth = 1.5;
@@ -549,6 +579,7 @@
         ctx.fill();
         ctx.restore();
         
+        ctx.globalAlpha = alpha * appear;
         // --- Eyes ---
         if (melt < this.eyesFallTime) {
           // Eyes still on face
@@ -633,8 +664,8 @@
         
         // --- Top Hat ---
         if (melt < this.hatFallTime) {
-          // Hat still on head
-          const hatY = headY - headRadius * headSquishY - 3;
+          // Hat still on head (it settles down onto the head as it appears)
+          const hatY = headY - headRadius * headSquishY - 3 - (1 - appear) * 8;
           const hatWidth = 8 * size;
           const hatHeight = 6 * size;
           const brimWidth = 11 * size;
@@ -677,10 +708,10 @@
           ctx.fillStyle = "rgba(255,255,255,0.15)";
           ctx.fillRect(-hatWidth / 2 + 1, -hatHeight + 1, 2, hatHeight - 2);
           ctx.restore();
-          ctx.globalAlpha = alpha;
+          ctx.globalAlpha = alpha * appear;
         }
       }
-      
+
       ctx.restore();
       ctx.globalAlpha = 1;
     }
@@ -698,18 +729,8 @@
     const minDistance = 60;
     if (snowmen.some(s => Math.abs(s.x - x) < minDistance)) return;
 
-    // Reduce snow around them FIRST with wider, gentler cutout
-    for (let i = -12; i <= 12; i++) {
-      const gi = groundIndex + i;
-      if (gi >= 0 && gi < ground.length) {
-        const falloff = 1 - Math.abs(i) / 12; // center gets reduced more
-        ground[gi] *= 0.3 + 0.4 * falloff;   // gentler reduction leaving more snow
-      }
-    }
-
-    // Now spawn snowman at the NEW ground height after cutout
-    const finalGroundHeight = ground[groundIndex];
-    snowmen.push(new Snowman(x, finalGroundHeight));
+    // The snowman gathers its snow from the drift around it while it builds (see Snowman.update)
+    snowmen.push(new Snowman(x, groundIndex));
   }
 
   function initFlakes(count) {
@@ -743,6 +764,7 @@
       ctx.lineTo(x, y);
     }
 
+    ctx.lineTo(width, height - ground[ground.length - 1]); // carry the snow line right to the edge
     ctx.lineTo(width, height);
     ctx.closePath();
     ctx.fill();
@@ -799,10 +821,11 @@ function smoothGround() {
   let lastTime = performance.now();
 
   function loop(now) {
-    const dt = now - lastTime;
+    // capped, so a long pause (OBS hiding the source) doesn't make everything jump
+    const dt = Math.min(50, now - lastTime);
     lastTime = now;
 
-    updateGust(now);
+    updateGust(now, dt);
     updateDensity(now, dt);
 
     const globalDensity = densityState.current;
@@ -819,10 +842,12 @@ function smoothGround() {
     // Background (transparent clear)
     drawBackground();
 
-    // Snowflakes
-    for (let i = 0; i < activeFlakeCount; i++) {
+    // Snowflakes. When the snow gets lighter, flakes past the active count that are still
+    // waiting above the screen just stay there; ones already falling finish their fall. So flakes
+    // never blink in or out mid-air as the density changes.
+    for (let i = 0; i < flakes.length; i++) {
       const f = flakes[i];
-      if (!f) break;
+      if (i >= activeFlakeCount && f.y + f.radius < 0) continue;
       f.update(dt, now, globalDensity);
       f.draw(ctx, globalDensity);
     }
